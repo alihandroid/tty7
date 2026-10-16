@@ -31,8 +31,9 @@ struct FakeMachine {
     /// Every pane closed, with the machine it was closed on.
     closed: Mutex<Vec<(Option<String>, u64)>>,
     /// A replay to give the next pane opened instead of the usual one, and
-    /// the messages it goes quiet before, for how long.
-    replay: Mutex<Option<(Vec<DaemonMsg>, Vec<(usize, Duration)>)>>,
+    /// the messages it goes quiet before, for how long, and whether the
+    /// message is on its way meanwhile.
+    replay: Mutex<Option<(Vec<DaemonMsg>, Vec<Stall>)>>,
 }
 
 impl FakeMachine {
@@ -127,6 +128,7 @@ impl Backend for FakeMachine {
             stalls: stall,
             sent: 0,
             stalled: None,
+            partial: 0,
             typed: rx,
         }))
     }
@@ -198,14 +200,20 @@ fn size(cols: u16, rows: u16) -> WinSize {
     }
 }
 
+/// Before which message of a replay it is held up, for how long, and whether
+/// that message trickles in meanwhile rather than nothing arriving at all.
+type Stall = (usize, Duration, bool);
+
 struct FakeFeed {
     replay: std::collections::VecDeque<DaemonMsg>,
     /// The replay goes quiet before its messages at these indexes, the way
     /// one held up on a slow link does; and how many it has given so far.
-    stalls: Vec<(usize, Duration)>,
+    stalls: Vec<Stall>,
     sent: usize,
-    /// Until when it is quiet, once it has gone so.
-    stalled: Option<Instant>,
+    /// Until when it is quiet, once it has gone so, and whether the next
+    /// message is coming in meanwhile; how much of it has.
+    stalled: Option<(Instant, bool)>,
+    partial: usize,
     typed: std_mpsc::Receiver<Vec<u8>>,
     leases: Option<FakeLeases>,
     answers: std_mpsc::Receiver<DaemonMsg>,
@@ -240,22 +248,31 @@ impl PaneFeed for FakeFeed {
             .map(|l| Box::new(l) as Box<dyn PaneLeases>)
     }
 
+    fn partial(&self) -> usize {
+        self.partial
+    }
+
     fn recv(&mut self, wait: Duration) -> io::Result<Option<DaemonMsg>> {
-        if let Some(at) = self.stalls.iter().position(|(at, _)| *at == self.sent) {
-            let (_, quiet) = self.stalls.remove(at);
-            self.stalled = Some(Instant::now() + quiet);
+        if let Some(at) = self.stalls.iter().position(|(at, ..)| *at == self.sent) {
+            let (_, quiet, trickle) = self.stalls.remove(at);
+            self.stalled = Some((Instant::now() + quiet, trickle));
         }
-        // Quiet the way a socket is: each wait runs out with nothing read.
-        if let Some(until) = self.stalled {
+        // Quiet the way a socket is: each wait runs out with nothing read,
+        // or with some of a message read but not all of it.
+        if let Some((until, trickle)) = self.stalled {
             let left = until.saturating_duration_since(Instant::now());
             if !left.is_zero() {
                 std::thread::sleep(left.min(wait));
+                if trickle {
+                    self.partial += 1;
+                }
                 return Ok(None);
             }
             self.stalled = None;
         }
         if let Some(msg) = self.replay.pop_front() {
             self.sent += 1;
+            self.partial = 0;
             return Ok(Some(msg));
         }
         if let Ok(answer) = self.answers.try_recv() {
@@ -480,7 +497,8 @@ async fn a_replay_held_up_mid_ring_is_drawn_whole() {
     // replay is given (`REPLAY_SETTLE`).
     let mut replay = two_sessions();
     replay.push(DaemonMsg::Cwd("/src/demo".into()));
-    *rig.machine.replay.lock().unwrap() = Some((replay, vec![(3, Duration::from_millis(150))]));
+    *rig.machine.replay.lock().unwrap() =
+        Some((replay, vec![(3, Duration::from_millis(150), false)]));
     let session = within(rig.paired()).await;
     let (_keys, mut screen) = within(session.pane(None, 1)).await.unwrap();
     let seen = screen_until(&mut screen, |item| {
@@ -504,7 +522,8 @@ async fn a_one_segment_replay_held_up_is_drawn_not_streamed() {
         DaemonMsg::Size(size(100, 30)),
         DaemonMsg::Snapshot(b"\x1bc NEW SESSION $ ".to_vec()),
     ];
-    *rig.machine.replay.lock().unwrap() = Some((replay, vec![(1, Duration::from_millis(150))]));
+    *rig.machine.replay.lock().unwrap() =
+        Some((replay, vec![(1, Duration::from_millis(150), false)]));
     let session = within(rig.paired()).await;
     let (_keys, mut screen) = within(session.pane(None, 1)).await.unwrap();
     let seen = screen_until(&mut screen, |item| {
@@ -529,8 +548,8 @@ async fn a_replay_slow_to_start_is_still_drawn_whole() {
     *rig.machine.replay.lock().unwrap() = Some((
         replay,
         vec![
-            (0, Duration::from_millis(700)),
-            (3, Duration::from_millis(150)),
+            (0, Duration::from_millis(700), false),
+            (3, Duration::from_millis(150), false),
         ],
     ));
     let session = within(rig.paired()).await;
@@ -544,6 +563,29 @@ async fn a_replay_slow_to_start_is_still_drawn_whole() {
         first.contains("NEW SESSION") && !first.contains("OLD SESSION"),
         "the phone's first picture of the pane has to be its current screen: \
          {first:?} (all: {seen:?})"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_segment_still_coming_in_is_not_the_end_of_the_replay() {
+    let rig = Rig::new().await;
+    // The last segment takes far longer than a replay is given to go quiet,
+    // the link pausing now and then as it comes: what has arrived of it so
+    // far is the replay still going, not over.
+    let mut replay = two_sessions();
+    replay.push(DaemonMsg::Cwd("/src/demo".into()));
+    *rig.machine.replay.lock().unwrap() =
+        Some((replay, vec![(3, Duration::from_millis(900), true)]));
+    let session = within(rig.paired()).await;
+    let (_keys, mut screen) = within(session.pane(None, 1)).await.unwrap();
+    let seen = screen_until(&mut screen, |item| {
+        matches!(item, PaneItem::Event(PaneEvent::Cwd { .. }))
+    })
+    .await;
+    let first = first_drawing(&seen);
+    assert!(
+        first.contains("NEW SESSION") && !first.contains("OLD SESSION"),
+        "drawn while the last segment was still coming in: {first:?} (all: {seen:?})"
     );
 }
 

@@ -93,6 +93,13 @@ pub trait PaneFeed: Send {
     /// The next message, or `Ok(None)` if none arrived within `wait`.
     fn recv(&mut self, wait: Duration) -> io::Result<Option<DaemonMsg>>;
 
+    /// How much of the next message has come in so far, without the rest of
+    /// it: a long one on a slow link is still arriving while `recv` comes
+    /// back empty.
+    fn partial(&self) -> usize {
+        0
+    }
+
     /// The way back to the daemon on the same connection, for a take-over.
     /// Taken once, before the feed goes to its reader thread.
     fn leases(&mut self) -> Option<Box<dyn PaneLeases>> {
@@ -742,9 +749,11 @@ fn read_pane(mut feed: Box<dyn PaneFeed>, down: mpsc::Sender<Down>) {
     // shows the phone what the pane had on it long ago — a restored session's
     // old screen, say — however long the replay takes over a slow link. The
     // quiet only counts once the feed has said something: a link slow to
-    // deliver the first frame is not a replay that has ended.
+    // deliver the first frame is not a replay that has ended. Nor is one
+    // still delivering a segment: part of a message is something said.
     let mut replaying = true;
     let mut heard: Option<Instant> = None;
+    let mut partial = 0;
     loop {
         if down.is_closed() {
             return;
@@ -766,12 +775,14 @@ fn read_pane(mut feed: Box<dyn PaneFeed>, down: mpsc::Sender<Down>) {
         // The replay is over at the first thing it does not consist of, or
         // once it has been quiet for long enough.
         if replaying {
+            let said = msg.is_some() || feed.partial() != partial;
+            partial = feed.partial();
             replaying = match &msg {
                 Some(DaemonMsg::Size(_) | DaemonMsg::Snapshot(_)) => true,
                 Some(_) => false,
-                None => heard.is_none_or(|at| at.elapsed() < REPLAY_SETTLE),
+                None => said || heard.is_none_or(|at| at.elapsed() < REPLAY_SETTLE),
             };
-            if msg.is_some() {
+            if said {
                 heard = Some(Instant::now());
             }
         }
