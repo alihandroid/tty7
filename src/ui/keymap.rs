@@ -56,8 +56,10 @@ fn fixed_bindings() -> Vec<KeyBinding> {
         // The Ctrl+R menu runs its selection on Cmd+Enter, which on macOS is
         // also `ToggleFullscreen`. Scoped to the open menu, it is deeper in
         // the dispatch path than the window binding and wins only there.
+        // `cmd`, not `secondary`: the menu's own key handler runs on the
+        // platform key everywhere, and Ctrl+Enter off macOS only accepts.
         KeyBinding::new(
-            "secondary-enter",
+            "cmd-enter",
             RunReverseSearchSelection,
             Some("Terminal && reverse_search"),
         ),

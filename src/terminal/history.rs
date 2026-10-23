@@ -344,13 +344,20 @@ fn reported_history_files() -> Vec<PathBuf> {
 fn parse_reported_history_files(text: &str) -> Vec<PathBuf> {
     // The file is written from inside panes, so it is only a hint: a relative
     // path would resolve against this process's directory, and a list that
-    // grew without bound is not one worth reading in full.
-    text.lines()
+    // grew without bound is not one worth reading in full. It is only ever
+    // appended to, and panes starting together each append the same path, so
+    // the newest distinct paths are the ones kept.
+    let mut seen = HashSet::new();
+    let mut files: Vec<PathBuf> = text
+        .lines()
+        .rev()
         .map(str::trim)
-        .filter(|line| looks_absolute(line))
+        .filter(|line| looks_absolute(line) && seen.insert(*line))
         .take(32)
         .map(PathBuf::from)
-        .collect()
+        .collect();
+    files.reverse();
+    files
 }
 
 fn read_shell_history_files(mut files: Vec<PathBuf>) -> Vec<Raw> {
@@ -732,6 +739,19 @@ mod tests {
             files,
             vec![PathBuf::from("/a/.zsh_history"), PathBuf::from("/b/hist")]
         );
+    }
+
+    #[test]
+    fn reported_history_files_keep_the_newest_distinct_paths() {
+        let mut text = String::new();
+        for i in 0..40 {
+            text.push_str(&format!("/old/{i}\n/dup\n"));
+        }
+        text.push_str("/new\n");
+        let files = parse_reported_history_files(&text);
+        assert_eq!(files.len(), 32);
+        assert_eq!(files.last(), Some(&PathBuf::from("/new")));
+        assert_eq!(files.iter().filter(|p| *p == Path::new("/dup")).count(), 1);
     }
 
     #[test]
